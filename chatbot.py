@@ -75,14 +75,16 @@ class KnowledgeBase:
 
 class InventoryDB:
     def __init__(self, db_path: Path, setup_sql_path: Path) -> None:
-        self.db_path = db_path
-        self.setup_sql_path = setup_sql_path
+        self.db_path = Path(db_path)
+        self.setup_sql_path = Path(setup_sql_path)
+        # Requirement: use a relative connection string (./inventory.db).
+        self._conn_str = f"./{self.db_path.name}"
 
     def _is_healthy(self) -> bool:
         if not self.db_path.exists():
             return False
         try:
-            with sqlite3.connect(str(self.db_path)) as con:
+            with sqlite3.connect(self._conn_str) as con:
                 con.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='product_inventory'"
                 ).fetchone()
@@ -112,12 +114,12 @@ class InventoryDB:
         if not self.setup_sql_path.exists():
             raise FileNotFoundError(f"Missing setup SQL file: {self.setup_sql_path}")
         sql = self.setup_sql_path.read_text(encoding="utf-8")
-        with sqlite3.connect(str(self.db_path)) as con:
+        with sqlite3.connect(self._conn_str) as con:
             con.executescript(sql)
 
     def list_item_names(self) -> list[str]:
         self.ensure_ready()
-        with sqlite3.connect(str(self.db_path)) as con:
+        with sqlite3.connect(self._conn_str) as con:
             rows = con.execute(
                 "SELECT DISTINCT item_name FROM product_inventory ORDER BY item_name"
             ).fetchall()
@@ -125,7 +127,7 @@ class InventoryDB:
 
     def get_stock_and_price(self, item_name: str, size: str) -> Optional[tuple[int, float]]:
         self.ensure_ready()
-        with sqlite3.connect(str(self.db_path)) as con:
+        with sqlite3.connect(self._conn_str) as con:
             row = con.execute(
                 """
                 SELECT stock_count, price_gbp
@@ -141,7 +143,7 @@ class InventoryDB:
 
     def get_price(self, item_name: str) -> Optional[float]:
         self.ensure_ready()
-        with sqlite3.connect(str(self.db_path)) as con:
+        with sqlite3.connect(self._conn_str) as con:
             row = con.execute(
                 """
                 SELECT price_gbp
@@ -246,8 +248,8 @@ class Chatbot:
         self.base_dir = (base_dir or Path(__file__).resolve().parent).resolve()
         os.chdir(self.base_dir)  # ensures relative paths like ./inventory.db behave as required
 
-        self.kb = KnowledgeBase(self.base_dir / "knowledge_base.txt")
-        self.db = InventoryDB(self.base_dir / "inventory.db", self.base_dir / "inventory_setup.sql")
+        self.kb = KnowledgeBase(Path("./knowledge_base.txt"))
+        self.db = InventoryDB(Path("./inventory.db"), Path("./inventory_setup.sql"))
         self._tool_caller: Optional[RuleBasedToolCaller] = None
 
     def _get_tool_caller(self) -> RuleBasedToolCaller:
