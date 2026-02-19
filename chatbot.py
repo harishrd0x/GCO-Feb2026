@@ -484,15 +484,27 @@ class Chatbot:
             return fact_answer
 
         system = (
-            "You are TechGear UK's sales-focused customer support assistant.\n"
-            "SCOPE: Answer questions about TechGear products, prices, sizes, stock, delivery, returns, and contact info.\n"
-            "OUT OF SCOPE: General questions (like 'How hot is the sun?') - politely decline and redirect to products.\n"
-            "TONE: Adopt a friendly, persuasive, and helpful sales tone while remaining truthful.\n"
-            "INSTRUCTIONS:\n"
-            "1. Answer using ONLY the facts provided in the context. Do not invent details.\n"
-            "2. For product questions, give the direct answer, then offer a helpful next step or alternative, and ask 1 short follow-up.\n"
-            "3. You MUST include the exact text from REQUIRED_FACT somewhere in your response.\n"
-            "4. For vague product queries, ask clarifying questions (e.g., size, color, delivery).\n"
+            "You are TechGear UK's friendly, persuasive sales-focused customer support assistant.\n"
+            "\n"
+            "CORE RESPONSIBILITIES:\n"
+            "1. Help customers with TechGear product inquiries, pricing, inventory, delivery, and company information.\n"
+            "2. Be warm, helpful, and sales-oriented when the question relates to TechGear.\n"
+            "3. For product questions: highlight benefits, offer alternatives, and suggest next steps.\n"
+            "4. Answer using ONLY facts provided in the context. Do not invent details.\n"
+            "5. You MUST include the exact text from REQUIRED_FACT somewhere in your response.\n"
+            "6. Always ask a helpful follow-up question.\n"
+            "\n"
+            "OUT-OF-SCOPE HANDLING:\n"
+            "If the user's question is clearly about general knowledge, trivia, or has nothing to do with TechGear:\n"
+            "- Respond with ONLY this message (word for word):\n"
+            "'I'm here to help with questions about TechGear products, prices, delivery, and our store. For questions outside our scope, I'm not able to help. Is there anything about our products or services I can assist you with?'\n"
+            "- Do NOT try to pivot to products or list inventory.\n"
+            "\n"
+            "EXAMPLES OF OUT-OF-SCOPE:\n"
+            "- 'What is the capital of France?' → Use fallback message\n"
+            "- 'Who is the Prime Minister?' → Use fallback message\n"
+            "- 'How hot is the sun?' → Use fallback message\n"
+            "- 'Can I have a discount code?' → This IS in-scope; respond helpfully\n"
         )
         user = (
             f"USER_QUESTION:\n{user_query}\n\n"
@@ -524,146 +536,138 @@ class Chatbot:
         if not user_query:
             return FALLBACK_MESSAGE
 
-        # Simple greeting / small-talk handling so the bot doesn't always fall back
-        # on casual messages like "hi" or "hello".
+        # Simple greeting / small-talk handling
         qn = _normalise(user_query)
         if qn in {"hi", "hello", "hey", "hiya"} or any(qn.startswith(g) for g in ("good morning", "good afternoon", "good evening")):
             return "Hello — I'm TechGear's support assistant. Ask about products, prices, or our office."
 
+        # Try KB answers first (company info: address, hours, delivery, etc)
         kb_answer = self.kb.answer(user_query)
         if kb_answer is not None:
-            return self._maybe_ai_wrap(
-                user_query=user_query,
-                fact_answer=kb_answer,
-                extra_context=self.kb.context_text(),
-            )
+            if self._ai_client is not None:
+                return self._maybe_ai_wrap(
+                    user_query=user_query,
+                    fact_answer=kb_answer,
+                    extra_context=self.kb.context_text(),
+                )
+            return kb_answer
 
+        # Try rule-based tool calls (exact product matching for price/stock)
         tool_call = self._get_tool_caller().decide(user_query)
-
-        # Resilient fallback: if the rule-based caller didn't decide but the user
-        # is clearly asking about price/stock, try a fuzzy lookup against inventory
-        # and handle it as a price/stock query so the bot behaves helpfully.
-        if tool_call is None:
-            qn = _normalise(user_query)
-            if any(k in qn for k in ("price", "cost", "how much")) or any(k in qn for k in ("how many", "stock", "in stock", "available", "do you have")):
-                best = self._find_best_item(user_query)
-                if best:
-                    size = RuleBasedToolCaller.SIZE_RE.search(user_query)
-                    if size:
-                        sz = size.group(1).upper()
-                        tool_call = ToolCall(name="get_stock_and_price", arguments={"item_name": best, "size": sz})
-                    else:
-                        tool_call = ToolCall(name="get_price", arguments={"item_name": best})
-        
-        # If rule-based caller still didn't match, try fuzzy item lookup + AI for any product-related query.
-        # This handles vague queries like "tell me about the hoodie?"
-        if tool_call is None:
-            best_item = self._find_best_item(user_query)
-            if best_item and self._ai_client is not None:
-                price = self.db.get_price(best_item)
+        if tool_call is not None:
+            if tool_call.name == "get_price":
+                price = self.db.get_price(tool_call.arguments["item_name"])
                 if price is not None:
-                    fact = f"{best_item} is £{price:.2f}."
-                else:
-                    fact = f"We have the {best_item} available."
-                ctx = "\n".join(
-                    [
-                        self.kb.context_text(),
-                        f"Product mentioned: {best_item}",
-                    ]
-                ).strip()
-                return self._maybe_ai_wrap(user_query=user_query, fact_answer=fact, extra_context=ctx)
+                    fact = _format_gbp(price)
+                    if self._ai_client is not None:
+                        ctx = "\n".join(
+                            [
+                                self.kb.context_text(),
+                                "Inventory facts:",
+                                f"- Item: {tool_call.arguments['item_name']}",
+                                f"- Price (GBP): {fact}",
+                            ]
+                        ).strip()
+                        return self._maybe_ai_wrap(user_query=user_query, fact_answer=fact, extra_context=ctx)
+                    return fact
+
+            elif tool_call.name == "get_stock_and_price":
+                res = self.db.get_stock_and_price(
+                    tool_call.arguments["item_name"], tool_call.arguments["size"]
+                )
+                if res is not None:
+                    stock_count, _price = res
+                    qn = _normalise(user_query)
+                    if "how many" in qn:
+                        fact = str(stock_count)
+                    elif "available" in qn and stock_count > 0:
+                        fact = f"Yes ({stock_count} in stock)"
+                    elif "available" in qn and stock_count <= 0:
+                        fact = "No (out of stock)"
+                    elif stock_count <= 0:
+                        fact = "0 / Out of stock"
+                    else:
+                        fact = f"Yes ({stock_count} in stock)"
+                    
+                    if self._ai_client is not None:
+                        ctx = "\n".join(
+                            [
+                                self.kb.context_text(),
+                                "Inventory facts:",
+                                f"- Item: {tool_call.arguments['item_name']}",
+                                f"- Size: {tool_call.arguments['size']}",
+                                f"- Stock count: {stock_count}",
+                            ]
+                        ).strip()
+                        return self._maybe_ai_wrap(user_query=user_query, fact_answer=fact, extra_context=ctx)
+                    return fact
+
+        # For everything else, use AI with full context
+        if self._ai_client is not None:
+            items = self.db.list_item_names()
+            kb_context = self.kb.context_text()
             
-            if tool_call is None:
-                return FALLBACK_MESSAGE
-
-        if tool_call.name == "get_price":
-            price = self.db.get_price(tool_call.arguments["item_name"])
-            if price is None:
-                return FALLBACK_MESSAGE
-            fact = _format_gbp(price)
-            ctx = "\n".join(
-                [
-                    self.kb.context_text(),
-                    "Inventory facts:",
-                    f"- Item: {tool_call.arguments['item_name']}",
-                    f"- Price (GBP): {fact}",
-                ]
+            # Build detailed product context so AI can answer any question
+            product_details = []
+            for item in items:
+                price = self.db.get_price(item)
+                price_str = f"£{price:.2f}" if price else "N/A"
+                product_details.append(f"- {item}: {price_str}")
+            
+            product_info = "Detailed product information:\n" + "\n".join(product_details) if product_details else ""
+            
+            full_context = "\n".join(
+                filter(None, [
+                    kb_context,
+                    product_info,
+                ])
             ).strip()
-            return self._maybe_ai_wrap(user_query=user_query, fact_answer=fact, extra_context=ctx)
-
-        if tool_call.name == "get_stock_and_price":
-            res = self.db.get_stock_and_price(
-                tool_call.arguments["item_name"], tool_call.arguments["size"]
+            
+            # For out-of-scope fallthrough, call AI directly without _maybe_ai_wrap
+            # to allow pure fallback message
+            system = (
+                "You are TechGear UK's friendly, helpful customer support assistant.\n"
+                "\n"
+                "CORE RESPONSIBILITIES:\n"
+                "1. Help customers with ANY TechGear product inquiries, pricing, inventory, delivery, and company information.\n"
+                "2. Product category questions are ALWAYS in-scope: 'Do you have pants?' 'What jackets?' 'Show me hoodies?'\n"
+                "   → Answer helpfully by listing matching products or explaining what we do have.\n"
+                "3. Be warm, helpful, and sales-oriented when answering product-related questions.\n"
+                "\n"
+                "OUT-OF-SCOPE (Fallback Message ONLY):\n"
+                "ONLY use the fallback message for pure trivia, general knowledge, or completely unrelated topics:\n"
+                "- 'What is the capital of France?' → Fallback message\n"
+                "- 'Who is the Prime Minister?' → Fallback message\n"
+                "- 'How hot is the sun?' → Fallback message\n"
+                "\n"
+                "When out-of-scope, respond with ONLY (word for word):\n"
+                "'I'm here to help with questions about TechGear products, prices, delivery, and our store. For questions outside our scope, I'm not able to help. Is there anything about our products or services I can assist you with?'\n"
+                "If the user asks something that isn't there in the knowledge base nor in DB but it falls under the same category as the existing product information, respond with helpful product information instead of the fallback message.\n"
+                "always try to interpret the user's query and respond \n"
+                "ask the user for clarification if you can't understand the question, but do not use the fallback message in that case"
             )
-            if res is None:
+            user_msg = f"USER_QUESTION:\n{user_query}\n\nCONTEXT (TechGear Info):\n{full_context}"
+            
+            try:
+                response = self._ai_client.chat(
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    temperature=0.7,
+                    max_tokens=220,
+                )
+                return (response or FALLBACK_MESSAGE).strip()
+            except Exception:
                 return FALLBACK_MESSAGE
-            stock_count, _price = res
-
-            qn = _normalise(user_query)
-            if "how many" in qn:
-                fact = str(stock_count)
-                ctx = "\n".join(
-                    [
-                        self.kb.context_text(),
-                        "Inventory facts:",
-                        f"- Item: {tool_call.arguments['item_name']}",
-                        f"- Size: {tool_call.arguments['size']}",
-                        f"- Stock count: {stock_count}",
-                    ]
-                ).strip()
-                return self._maybe_ai_wrap(user_query=user_query, fact_answer=fact, extra_context=ctx)
-
-            if "available" in qn and stock_count > 0:
-                fact = f"Yes ({stock_count} in stock)"
-                ctx = "\n".join(
-                    [
-                        self.kb.context_text(),
-                        "Inventory facts:",
-                        f"- Item: {tool_call.arguments['item_name']}",
-                        f"- Size: {tool_call.arguments['size']}",
-                        f"- Stock count: {stock_count}",
-                    ]
-                ).strip()
-                return self._maybe_ai_wrap(user_query=user_query, fact_answer=fact, extra_context=ctx)
-            if "available" in qn and stock_count <= 0:
-                fact = "No (out of stock)"
-                ctx = "\n".join(
-                    [
-                        self.kb.context_text(),
-                        "Inventory facts:",
-                        f"- Item: {tool_call.arguments['item_name']}",
-                        f"- Size: {tool_call.arguments['size']}",
-                        f"- Stock count: {stock_count}",
-                    ]
-                ).strip()
-                return self._maybe_ai_wrap(user_query=user_query, fact_answer=fact, extra_context=ctx)
-
-            if stock_count <= 0:
-                fact = "0 / Out of stock"
-                ctx = "\n".join(
-                    [
-                        self.kb.context_text(),
-                        "Inventory facts:",
-                        f"- Item: {tool_call.arguments['item_name']}",
-                        f"- Size: {tool_call.arguments['size']}",
-                        f"- Stock count: {stock_count}",
-                    ]
-                ).strip()
-                return self._maybe_ai_wrap(user_query=user_query, fact_answer=fact, extra_context=ctx)
-
-            fact = f"Yes ({stock_count} in stock)"
-            ctx = "\n".join(
-                [
-                    self.kb.context_text(),
-                    "Inventory facts:",
-                    f"- Item: {tool_call.arguments['item_name']}",
-                    f"- Size: {tool_call.arguments['size']}",
-                    f"- Stock count: {stock_count}",
-                ]
-            ).strip()
-            return self._maybe_ai_wrap(user_query=user_query, fact_answer=fact, extra_context=ctx)
-
+        
+        # No AI and no rule-based match
         return FALLBACK_MESSAGE
+
+
+
+
+
 
 
 def main() -> None:
