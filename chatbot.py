@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 FALLBACK_MESSAGE = "I'm sorry, I cannot answer your query at the moment."
 
 
@@ -243,6 +247,86 @@ class RuleBasedToolCaller:
         return None
 
 
+class AIHelper:
+    """Wraps Azure OpenAI to generate conversational, open-ended responses."""
+
+    def __init__(self) -> None:
+        self.client = None
+        self.model = os.getenv("AZURE_OPENAI_MODEL", "gpt-4o-mini")
+        self._init_client()
+
+    def _init_client(self) -> None:
+        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+        api_key = os.getenv("AZURE_OPENAI_KEY", "")
+        api_version = os.getenv("AZURE_API_VERSION", "2025-01-01-preview")
+
+        if not endpoint or not api_key or api_key.startswith("<"):
+            return
+
+        try:
+            from openai import AzureOpenAI
+            self.client = AzureOpenAI(
+                azure_endpoint=endpoint,
+                api_key=api_key,
+                api_version=api_version,
+            )
+        except Exception:
+            self.client = None
+
+    @property
+    def is_available(self) -> bool:
+        return self.client is not None
+
+    def generate_response(
+        self,
+        user_query: str,
+        kb_context: str,
+        db_context: str,
+        structured_answer: Optional[str] = None,
+    ) -> Optional[str]:
+        if not self.is_available:
+            return None
+
+        system_prompt = (
+            "You are a friendly and helpful customer service assistant for TechGear UK.\n"
+            "Use ONLY the knowledge base and inventory data provided below to answer questions.\n\n"
+            f"KNOWLEDGE BASE:\n{kb_context}\n\n"
+            f"INVENTORY DATA:\n{db_context}\n\n"
+            "GUIDELINES:\n"
+            "- Be warm, friendly, and conversational in your tone.\n"
+            "- Provide detailed, open-ended answers that feel natural and engaging.\n"
+            "- Always include the specific data values (prices, stock counts, addresses, hours, etc.) "
+            "accurately and verbatim in your response.\n"
+            "- When you mention a price, always use the exact GBP format (e.g. £25.00).\n"
+            "- When you mention stock availability, include the exact count.\n"
+            "- Offer additional helpful information from the knowledge base when relevant "
+            "(e.g. mention delivery options after a stock question, suggest related products).\n"
+            "- Keep responses concise but informative — aim for 2-4 sentences.\n"
+            f'- If the question is NOT related to TechGear UK products or services, respond with EXACTLY: "{FALLBACK_MESSAGE}"\n'
+        )
+
+        if structured_answer:
+            system_prompt += (
+                f"\nVERIFIED DATA: The precise answer from our system is: {structured_answer}\n"
+                "You MUST include this exact value somewhere in your conversational response.\n"
+            )
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_query},
+                ],
+                temperature=0.7,
+                max_tokens=300,
+            )
+            content = response.choices[0].message.content
+            return content.strip() if content else None
+        except Exception:
+            return None
+
+
 class Chatbot:
     def __init__(self, base_dir: Optional[Path] = None) -> None:
         self.base_dir = (base_dir or Path(__file__).resolve().parent).resolve()
@@ -251,17 +335,37 @@ class Chatbot:
         self.kb = KnowledgeBase(Path("./knowledge_base.txt"))
         self.db = InventoryDB(Path("./inventory.db"), Path("./inventory_setup.sql"))
         self._tool_caller: Optional[RuleBasedToolCaller] = None
+        self.ai = AIHelper()
 
     def _get_tool_caller(self) -> RuleBasedToolCaller:
         if self._tool_caller is None:
             self._tool_caller = RuleBasedToolCaller(self.db.list_item_names())
         return self._tool_caller
 
-    def get_response(self, user_query: str) -> str:
-        user_query = user_query.strip()
-        if not user_query:
-            return FALLBACK_MESSAGE
+    def _get_kb_context(self) -> str:
+        try:
+            return Path("./knowledge_base.txt").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return ""
 
+    def _get_db_context(self) -> str:
+        try:
+            self.db.ensure_ready()
+            with sqlite3.connect(self.db._conn_str) as con:
+                rows = con.execute(
+                    "SELECT item_name, size, stock_count, price_gbp "
+                    "FROM product_inventory ORDER BY item_name, size"
+                ).fetchall()
+            lines = ["Product Inventory:"]
+            for name, size, stock, price in rows:
+                status = f"{stock} in stock" if stock > 0 else "Out of stock"
+                lines.append(f"  - {name} (Size {size}): £{price:.2f}, {status}")
+            return "\n".join(lines)
+        except Exception:
+            return "Inventory data unavailable."
+
+    def _rule_based_response(self, user_query: str) -> str:
+        """Original deterministic logic — used as fallback when AI is unavailable."""
         kb_answer = self.kb.answer(user_query)
         if kb_answer is not None:
             return kb_answer
@@ -299,6 +403,32 @@ class Chatbot:
 
         return FALLBACK_MESSAGE
 
+    def get_response(self, user_query: str) -> str:
+        user_query = user_query.strip()
+        if not user_query:
+            return FALLBACK_MESSAGE
+
+        structured_answer = self._rule_based_response(user_query)
+
+        if not self.ai.is_available:
+            return structured_answer
+
+        kb_context = self._get_kb_context()
+        db_context = self._get_db_context()
+
+        data_hint = structured_answer if structured_answer != FALLBACK_MESSAGE else None
+
+        ai_response = self.ai.generate_response(
+            user_query, kb_context, db_context, structured_answer=data_hint
+        )
+
+        if ai_response:
+            if data_hint and data_hint not in ai_response:
+                return structured_answer
+            return ai_response
+
+        return structured_answer
+
 
 def main() -> None:
     import sys
@@ -307,6 +437,10 @@ def main() -> None:
     debug = "--debug" in sys.argv
 
     print("TechGear chatbot — ask a question or type 'quit' to exit")
+    if bot.ai.is_available:
+        print("AI mode: ON (Azure OpenAI)", flush=True)
+    else:
+        print("AI mode: OFF (rule-based fallback — set AZURE_OPENAI_KEY in .env to enable)", flush=True)
     if debug:
         print("DEBUG: running in debug mode", flush=True)
 
