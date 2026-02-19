@@ -1,0 +1,12 @@
+[
+  {"id": 1, "type": "KB", "q": "What is the office address?", "target": "124 High Street, EC1A 1BB"},
+  {"id": 2, "type": "KB", "q": "When do you open on Monday?", "target": "09:00 - 18:00"},
+  {"id": 3, "type": "KB", "q": "How much is next-day delivery?", "target": "£5.99"},
+  {"id": 4, "type": "DB", "q": "Is the Waterproof Commuter Jacket available in XL?", "target": "Yes (3 in stock)"},
+  {"id": 5, "type": "DB", "q": "Do you have the Waterproof Commuter Jacket in size M?", "target": "0 / Out of stock"},
+  {"id": 6, "type": "DB", "q": "How many Tech-Knit Hoodies in size M?", "target": "10"},
+  {"id": 7, "type": "DB", "q": "What is the price of the Dry-Fit Running Tee?", "target": "£25.00"},
+  {"id": 8, "type": "Fallback", "q": "What is the capital of France?", "target": "Default error message"},
+  {"id": 9, "type": "Fallback", "q": "Can I have a discount code?", "target": "Default error message"},
+  {"id": 10, "type": "Fallback", "q": "Who is the Prime Minister?", "target": "Default error message"}
+]
