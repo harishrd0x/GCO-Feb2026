@@ -301,7 +301,15 @@ class Chatbot:
 
 
 def main() -> None:
+    import sys
+
     bot = Chatbot()
+    debug = "--debug" in sys.argv
+
+    print("TechGear chatbot — ask a question or type 'quit' to exit")
+    if debug:
+        print("DEBUG: running in debug mode", flush=True)
+
     while True:
         try:
             user_query = input("> ").strip()
@@ -312,7 +320,23 @@ def main() -> None:
         if _normalise(user_query) in {"exit", "quit"}:
             break
 
-        print(bot.get_response(user_query))
+        if debug:
+            print(f"DEBUG: raw input: {user_query!r}", flush=True)
+            kb_answer = bot.kb.answer(user_query)
+            print(f"DEBUG: kb_answer: {kb_answer!r}", flush=True)
+            tool_call = bot._get_tool_caller().decide(user_query)
+            print(f"DEBUG: tool_call: {tool_call!r}", flush=True)
+            if tool_call and tool_call.name == "get_price":
+                price = bot.db.get_price(tool_call.arguments["item_name"])
+                print(f"DEBUG: db.get_price -> {price!r}", flush=True)
+            if tool_call and tool_call.name == "get_stock_and_price":
+                sp = bot.db.get_stock_and_price(
+                    tool_call.arguments["item_name"], tool_call.arguments["size"]
+                )
+                print(f"DEBUG: db.get_stock_and_price -> {sp!r}", flush=True)
+
+        # Ensure immediate output so terminal users see responses.
+        print(bot.get_response(user_query), flush=True)
 
 
 if __name__ == "__main__":
