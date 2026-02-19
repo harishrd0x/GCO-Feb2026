@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from difflib import SequenceMatcher
 import shutil
 import sqlite3
 import subprocess
@@ -12,12 +13,44 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
-FALLBACK_MESSAGE = "I'm sorry, I cannot answer your query at the moment."
+FALLBACK_MESSAGE = (
+    "I'm here to help with questions about TechGear products, prices, delivery, and our store. "
+    "For questions outside our scope, I'm not able to help. "
+    "Is there anything about our products or services I can assist you with?"
+)
+
+
+def _load_env_file(path: Path = Path(".env")) -> None:
+    """Lightweight .env loader so keys in a workspace `.env` are available via os.environ.
+
+    This avoids requiring external dependencies while making local development convenient.
+    """
+    try:
+        if not path.exists():
+            return
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            os.environ.setdefault(k, v)
+    except Exception:
+        # Best-effort only; don't fail the application for a malformed .env file.
+        pass
+
+
+# Load local .env automatically (harmless if not present).
+_load_env_file()
 
 
 def _normalise(text: str) -> str:
     text = text.strip().lower()
-    text = re.sub(r"[^\w\s£-]", "", text)
+    # Treat hyphens as token separators so item names like "Tech-Knit" match
+    # user input written as "tech knit" (without the hyphen).
+    text = text.replace("-", " ")
+    text = re.sub(r"[^\w\s£]", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -312,7 +345,33 @@ class RuleBasedToolCaller:
             if overlap > best[0]:
                 best = (overlap, item)
 
-        return best[1] if best[0] >= 0.6 else None
+        # Try fuzzy matching on the full string (handles misspellings, token reorder).
+        def _sim(a: str, b: str) -> float:
+            return float(SequenceMatcher(None, a, b).ratio())
+
+        for item_norm, item in self._known_items_norm:
+            sim = _sim(qn, item_norm)
+            if sim > best[0]:
+                best = (sim, item)
+
+        # Also consider token-level fuzzy matches to capture partial/misspelled tokens.
+        for item_norm, item in self._known_items_norm:
+            item_tokens = list(self._canon_tokens(item_norm))
+            if not item_tokens:
+                continue
+            q_token_list = list(q_tokens)
+            # average of best-match per item token
+            total = 0.0
+            for it in item_tokens:
+                best_tok_sim = 0.0
+                for qt in q_token_list:
+                    best_tok_sim = max(best_tok_sim, _sim(qt, it))
+                total += best_tok_sim
+            avg_tok_sim = total / len(item_tokens)
+            if avg_tok_sim > best[0]:
+                best = (avg_tok_sim, item)
+
+        return best[1] if best[0] >= 0.5 else None
 
     def decide(self, user_query: str) -> Optional[ToolCall]:
         qn = _normalise(user_query)
@@ -348,6 +407,9 @@ class Chatbot:
 
         self.kb = KnowledgeBase(Path("./knowledge_base.txt"))
         self.db = InventoryDB(Path("./inventory.db"), Path("./inventory_setup.sql"))
+        # If you set an API key in `.env` (API_KEY=...), it will be loaded into os.environ
+        # by the loader earlier in this file. Expose it here for optional integrations.
+        self.api_key: Optional[str] = os.getenv("API_KEY")
         self._tool_caller: Optional[RuleBasedToolCaller] = None
         self._ai_client: Optional[AzureOpenAIChatClient] = None
 
@@ -369,6 +431,49 @@ class Chatbot:
             self._tool_caller = RuleBasedToolCaller(self.db.list_item_names())
         return self._tool_caller
 
+    def _find_best_item(self, user_query: str) -> Optional[str]:
+        """Best-effort fuzzy lookup over current inventory item names.
+
+        Used as a resilient fallback when the rule-based caller didn't decide.
+        """
+        items = self.db.list_item_names()
+        if not items:
+            return None
+
+        qn = _normalise(user_query)
+        best: tuple[float, Optional[str]] = (0.0, None)
+        from difflib import SequenceMatcher
+
+        def sim(a: str, b: str) -> float:
+            return float(SequenceMatcher(None, a, b).ratio())
+
+        # Compare against normalised item names
+        for it in items:
+            it_norm = _normalise(it)
+            s = sim(qn, it_norm)
+            if s > best[0]:
+                best = (s, it)
+
+        # token-level fuzzy
+        q_tokens = {t for t in qn.split() if t}
+        for it in items:
+            it_norm = _normalise(it)
+            it_tokens = {t for t in it_norm.split() if t}
+            if not it_tokens:
+                continue
+            # average best-match per token
+            total = 0.0
+            for tok in it_tokens:
+                best_tok = 0.0
+                for qt in q_tokens:
+                    best_tok = max(best_tok, sim(qt, tok))
+                total += best_tok
+            avg = total / len(it_tokens)
+            if avg > best[0]:
+                best = (avg, it)
+
+        return best[1] if best[0] >= 0.6 else None
+
     def _maybe_ai_wrap(self, *, user_query: str, fact_answer: str, extra_context: str) -> str:
         """
         Wrap a deterministic fact answer into an open-ended response,
@@ -379,11 +484,15 @@ class Chatbot:
             return fact_answer
 
         system = (
-            "You are TechGear UK’s customer support assistant.\n"
-            "Answer using ONLY the facts provided in the context. Do not invent details.\n"
-            "Your response must be open-ended: give the direct answer, then offer a helpful next step "
-            "or alternative, and ask 1 short follow-up question.\n"
-            "You MUST include the exact text from REQUIRED_FACT somewhere in your response.\n"
+            "You are TechGear UK's sales-focused customer support assistant.\n"
+            "SCOPE: Answer questions about TechGear products, prices, sizes, stock, delivery, returns, and contact info.\n"
+            "OUT OF SCOPE: General questions (like 'How hot is the sun?') - politely decline and redirect to products.\n"
+            "TONE: Adopt a friendly, persuasive, and helpful sales tone while remaining truthful.\n"
+            "INSTRUCTIONS:\n"
+            "1. Answer using ONLY the facts provided in the context. Do not invent details.\n"
+            "2. For product questions, give the direct answer, then offer a helpful next step or alternative, and ask 1 short follow-up.\n"
+            "3. You MUST include the exact text from REQUIRED_FACT somewhere in your response.\n"
+            "4. For vague product queries, ask clarifying questions (e.g., size, color, delivery).\n"
         )
         user = (
             f"USER_QUESTION:\n{user_query}\n\n"
@@ -415,6 +524,12 @@ class Chatbot:
         if not user_query:
             return FALLBACK_MESSAGE
 
+        # Simple greeting / small-talk handling so the bot doesn't always fall back
+        # on casual messages like "hi" or "hello".
+        qn = _normalise(user_query)
+        if qn in {"hi", "hello", "hey", "hiya"} or any(qn.startswith(g) for g in ("good morning", "good afternoon", "good evening")):
+            return "Hello — I'm TechGear's support assistant. Ask about products, prices, or our office."
+
         kb_answer = self.kb.answer(user_query)
         if kb_answer is not None:
             return self._maybe_ai_wrap(
@@ -424,8 +539,42 @@ class Chatbot:
             )
 
         tool_call = self._get_tool_caller().decide(user_query)
+
+        # Resilient fallback: if the rule-based caller didn't decide but the user
+        # is clearly asking about price/stock, try a fuzzy lookup against inventory
+        # and handle it as a price/stock query so the bot behaves helpfully.
         if tool_call is None:
-            return FALLBACK_MESSAGE
+            qn = _normalise(user_query)
+            if any(k in qn for k in ("price", "cost", "how much")) or any(k in qn for k in ("how many", "stock", "in stock", "available", "do you have")):
+                best = self._find_best_item(user_query)
+                if best:
+                    size = RuleBasedToolCaller.SIZE_RE.search(user_query)
+                    if size:
+                        sz = size.group(1).upper()
+                        tool_call = ToolCall(name="get_stock_and_price", arguments={"item_name": best, "size": sz})
+                    else:
+                        tool_call = ToolCall(name="get_price", arguments={"item_name": best})
+        
+        # If rule-based caller still didn't match, try fuzzy item lookup + AI for any product-related query.
+        # This handles vague queries like "tell me about the hoodie?"
+        if tool_call is None:
+            best_item = self._find_best_item(user_query)
+            if best_item and self._ai_client is not None:
+                price = self.db.get_price(best_item)
+                if price is not None:
+                    fact = f"{best_item} is £{price:.2f}."
+                else:
+                    fact = f"We have the {best_item} available."
+                ctx = "\n".join(
+                    [
+                        self.kb.context_text(),
+                        f"Product mentioned: {best_item}",
+                    ]
+                ).strip()
+                return self._maybe_ai_wrap(user_query=user_query, fact_answer=fact, extra_context=ctx)
+            
+            if tool_call is None:
+                return FALLBACK_MESSAGE
 
         if tool_call.name == "get_price":
             price = self.db.get_price(tool_call.arguments["item_name"])
