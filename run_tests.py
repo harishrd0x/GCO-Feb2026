@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from chatbot import Chatbot, FALLBACK_MESSAGE
 
 
 def main() -> None:
+    # Ensure deterministic offline behaviour for the test suite.
+    os.environ["CHATBOT_USE_LLM"] = "0"
+
     base_dir = Path(__file__).resolve().parent
     suite_path = base_dir / "test_suite.json"
     tests = json.loads(suite_path.read_text(encoding="utf-8"))

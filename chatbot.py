@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
-from llm_client import LLMConfig, OpenAICompatibleClient
+from llm_client import build_llm_client_from_env
 
 FALLBACK_MESSAGE = "I'm sorry, I cannot answer your query at the moment."
 
@@ -24,6 +24,20 @@ def _normalise(text: str) -> str:
 
 def _format_gbp(value: float) -> str:
     return f"£{value:.2f}"
+
+
+def _load_dotenv(dotenv_path: Path) -> None:
+    if not dotenv_path.exists():
+        return
+    for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        key = k.strip()
+        val = v.strip().strip("'").strip('"')
+        if key and key not in os.environ:
+            os.environ[key] = val
 
 
 class KnowledgeBase:
@@ -285,15 +299,15 @@ class Chatbot:
         self.base_dir = (base_dir or Path(__file__).resolve().parent).resolve()
         os.chdir(self.base_dir)  # ensures relative paths like ./inventory.db behave as required
 
+        _load_dotenv(Path("./.env"))
+
         self.kb = KnowledgeBase(Path("./knowledge_base.txt"))
         self.db = InventoryDB(Path("./inventory.db"), Path("./inventory_setup.sql"))
         self._tool_caller: Optional[RuleBasedToolCaller] = None
         self._llm = None
         self._llm_enabled = os.getenv("CHATBOT_USE_LLM", "0").strip() == "1"
         if self._llm_enabled:
-            cfg = LLMConfig.from_env()
-            if cfg:
-                self._llm = OpenAICompatibleClient(cfg)
+            self._llm = build_llm_client_from_env()
 
     def _get_tool_caller(self) -> RuleBasedToolCaller:
         if self._tool_caller is None:
@@ -391,7 +405,7 @@ class Chatbot:
 
         # First call: let model decide tool use.
         resp = self._llm.chat_completions(
-            {"model": self._llm.config.model, "messages": messages, "tools": tools, "tool_choice": "auto"}
+            {"model": self._llm.model, "messages": messages, "tools": tools, "tool_choice": "auto"}
         )
         choice = (resp.get("choices") or [{}])[0]
         msg = choice.get("message") or {}
@@ -472,7 +486,10 @@ class Chatbot:
             }
         )
 
-        resp2 = self._llm.chat_completions({"model": self._llm.config.model, "messages": messages})
+        if not must_include:
+            return FALLBACK_MESSAGE
+
+        resp2 = self._llm.chat_completions({"model": self._llm.model, "messages": messages})
         choice2 = (resp2.get("choices") or [{}])[0]
         msg2 = choice2.get("message") or {}
         content = str(msg2.get("content", "")).strip()
