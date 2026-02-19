@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import sqlite3
 import subprocess
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -23,10 +26,84 @@ def _format_gbp(value: float) -> str:
     return f"£{value:.2f}"
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    raw = os.getenv(name, default).strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _load_dotenv(dotenv_path: Path) -> None:
+    """
+    Minimal .env loader (no external deps).
+    Does not override already-set environment variables.
+    """
+
+    if not dotenv_path.exists():
+        return
+
+    for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        key = k.strip()
+        val = v.strip()
+        if not key or key in os.environ:
+            continue
+        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+            val = val[1:-1]
+        os.environ[key] = val
+
+
+class AzureOpenAIChatClient:
+    def __init__(self, *, endpoint: str, api_key: str, api_version: str, deployment: str) -> None:
+        self.endpoint = endpoint.rstrip("/")
+        self.api_key = api_key
+        self.api_version = api_version
+        self.deployment = deployment
+
+    def chat(self, *, messages: list[dict[str, str]], temperature: float = 0.6, max_tokens: int = 250) -> str:
+        url = (
+            f"{self.endpoint}/openai/deployments/{self.deployment}/chat/completions"
+            f"?api-version={self.api_version}"
+        )
+        payload = {
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "api-key": self.api_key,
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace") if getattr(e, "fp", None) else str(e)
+            raise RuntimeError(f"Azure OpenAI HTTP error: {e.code} {detail}") from e
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"Azure OpenAI request failed: {e}") from e
+
+        parsed = json.loads(body)
+        content = (
+            parsed.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+        return (content or "").strip()
+
+
 class KnowledgeBase:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._fields: dict[str, str] = {}
+        self._raw_kv_lines: list[tuple[str, str]] = []
         self._load()
 
     def _load(self) -> None:
@@ -34,13 +111,24 @@ class KnowledgeBase:
             return
 
         fields: dict[str, str] = {}
+        raw_kv_lines: list[tuple[str, str]] = []
         for raw_line in self.path.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
             if not line or ":" not in line:
                 continue
             k, v = line.split(":", 1)
+            key_raw = k.strip()
+            val_raw = v.strip()
             fields[_normalise(k)] = v.strip()
+            raw_kv_lines.append((key_raw, val_raw))
         self._fields = fields
+        self._raw_kv_lines = raw_kv_lines
+
+    def context_text(self) -> str:
+        if not self._raw_kv_lines:
+            return ""
+        lines = [f"- {k}: {v}" for (k, v) in self._raw_kv_lines]
+        return "Knowledge base facts:\n" + "\n".join(lines)
 
     def answer(self, user_query: str) -> Optional[str]:
         q = _normalise(user_query)
@@ -48,6 +136,8 @@ class KnowledgeBase:
         location = self._fields.get("location")
         hours = self._fields.get("office hours")
         delivery_policy = self._fields.get("delivery policy")
+        returns_policy = self._fields.get("returns")
+        contact = self._fields.get("contact")
 
         if ("address" in q or "office address" in q or "location" in q) and location:
             # Keep answer concise and stable for automated checks.
@@ -69,6 +159,12 @@ class KnowledgeBase:
             m = re.search(r"£\d+(?:\.\d{2})?", delivery_policy)
             if m:
                 return m.group(0)
+
+        if any(k in q for k in ("return", "refund", "exchange")) and returns_policy:
+            return returns_policy
+
+        if any(k in q for k in ("contact", "support", "email", "phone", "call")) and contact:
+            return contact
 
         return None
 
@@ -248,14 +344,71 @@ class Chatbot:
         self.base_dir = (base_dir or Path(__file__).resolve().parent).resolve()
         os.chdir(self.base_dir)  # ensures relative paths like ./inventory.db behave as required
 
+        _load_dotenv(self.base_dir / ".env")
+
         self.kb = KnowledgeBase(Path("./knowledge_base.txt"))
         self.db = InventoryDB(Path("./inventory.db"), Path("./inventory_setup.sql"))
         self._tool_caller: Optional[RuleBasedToolCaller] = None
+        self._ai_client: Optional[AzureOpenAIChatClient] = None
+
+        if _env_flag("CHATBOT_USE_AI"):
+            endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
+            api_key = os.getenv("AZURE_OPENAI_KEY", "").strip()
+            api_version = os.getenv("AZURE_API_VERSION", "").strip()
+            deployment = os.getenv("AZURE_OPENAI_MODEL", os.getenv("AZURE_OPENAI_DEPLOYMENT", "")).strip()
+            if endpoint and api_key and api_version and deployment:
+                self._ai_client = AzureOpenAIChatClient(
+                    endpoint=endpoint,
+                    api_key=api_key,
+                    api_version=api_version,
+                    deployment=deployment,
+                )
 
     def _get_tool_caller(self) -> RuleBasedToolCaller:
         if self._tool_caller is None:
             self._tool_caller = RuleBasedToolCaller(self.db.list_item_names())
         return self._tool_caller
+
+    def _maybe_ai_wrap(self, *, user_query: str, fact_answer: str, extra_context: str) -> str:
+        """
+        Wrap a deterministic fact answer into an open-ended response,
+        grounded in KB/DB context. Falls back to fact_answer on any errors.
+        """
+
+        if self._ai_client is None:
+            return fact_answer
+
+        system = (
+            "You are TechGear UK’s customer support assistant.\n"
+            "Answer using ONLY the facts provided in the context. Do not invent details.\n"
+            "Your response must be open-ended: give the direct answer, then offer a helpful next step "
+            "or alternative, and ask 1 short follow-up question.\n"
+            "You MUST include the exact text from REQUIRED_FACT somewhere in your response.\n"
+        )
+        user = (
+            f"USER_QUESTION:\n{user_query}\n\n"
+            f"REQUIRED_FACT:\n{fact_answer}\n\n"
+            f"CONTEXT:\n{extra_context}\n"
+        )
+        try:
+            out = self._ai_client.chat(
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.7,
+                max_tokens=220,
+            )
+        except Exception:
+            return fact_answer
+
+        out = (out or "").strip()
+        if not out:
+            return fact_answer
+        if fact_answer not in out:
+            # Ensure tests/consumers always see the grounded fact string.
+            out = f"{fact_answer} {out}".strip()
+        return out
 
     def get_response(self, user_query: str) -> str:
         user_query = user_query.strip()
@@ -264,7 +417,11 @@ class Chatbot:
 
         kb_answer = self.kb.answer(user_query)
         if kb_answer is not None:
-            return kb_answer
+            return self._maybe_ai_wrap(
+                user_query=user_query,
+                fact_answer=kb_answer,
+                extra_context=self.kb.context_text(),
+            )
 
         tool_call = self._get_tool_caller().decide(user_query)
         if tool_call is None:
@@ -274,7 +431,16 @@ class Chatbot:
             price = self.db.get_price(tool_call.arguments["item_name"])
             if price is None:
                 return FALLBACK_MESSAGE
-            return _format_gbp(price)
+            fact = _format_gbp(price)
+            ctx = "\n".join(
+                [
+                    self.kb.context_text(),
+                    "Inventory facts:",
+                    f"- Item: {tool_call.arguments['item_name']}",
+                    f"- Price (GBP): {fact}",
+                ]
+            ).strip()
+            return self._maybe_ai_wrap(user_query=user_query, fact_answer=fact, extra_context=ctx)
 
         if tool_call.name == "get_stock_and_price":
             res = self.db.get_stock_and_price(
@@ -286,16 +452,67 @@ class Chatbot:
 
             qn = _normalise(user_query)
             if "how many" in qn:
-                return str(stock_count)
+                fact = str(stock_count)
+                ctx = "\n".join(
+                    [
+                        self.kb.context_text(),
+                        "Inventory facts:",
+                        f"- Item: {tool_call.arguments['item_name']}",
+                        f"- Size: {tool_call.arguments['size']}",
+                        f"- Stock count: {stock_count}",
+                    ]
+                ).strip()
+                return self._maybe_ai_wrap(user_query=user_query, fact_answer=fact, extra_context=ctx)
 
             if "available" in qn and stock_count > 0:
-                return f"Yes ({stock_count} in stock)"
+                fact = f"Yes ({stock_count} in stock)"
+                ctx = "\n".join(
+                    [
+                        self.kb.context_text(),
+                        "Inventory facts:",
+                        f"- Item: {tool_call.arguments['item_name']}",
+                        f"- Size: {tool_call.arguments['size']}",
+                        f"- Stock count: {stock_count}",
+                    ]
+                ).strip()
+                return self._maybe_ai_wrap(user_query=user_query, fact_answer=fact, extra_context=ctx)
             if "available" in qn and stock_count <= 0:
-                return "No (out of stock)"
+                fact = "No (out of stock)"
+                ctx = "\n".join(
+                    [
+                        self.kb.context_text(),
+                        "Inventory facts:",
+                        f"- Item: {tool_call.arguments['item_name']}",
+                        f"- Size: {tool_call.arguments['size']}",
+                        f"- Stock count: {stock_count}",
+                    ]
+                ).strip()
+                return self._maybe_ai_wrap(user_query=user_query, fact_answer=fact, extra_context=ctx)
 
             if stock_count <= 0:
-                return "0 / Out of stock"
-            return f"Yes ({stock_count} in stock)"
+                fact = "0 / Out of stock"
+                ctx = "\n".join(
+                    [
+                        self.kb.context_text(),
+                        "Inventory facts:",
+                        f"- Item: {tool_call.arguments['item_name']}",
+                        f"- Size: {tool_call.arguments['size']}",
+                        f"- Stock count: {stock_count}",
+                    ]
+                ).strip()
+                return self._maybe_ai_wrap(user_query=user_query, fact_answer=fact, extra_context=ctx)
+
+            fact = f"Yes ({stock_count} in stock)"
+            ctx = "\n".join(
+                [
+                    self.kb.context_text(),
+                    "Inventory facts:",
+                    f"- Item: {tool_call.arguments['item_name']}",
+                    f"- Size: {tool_call.arguments['size']}",
+                    f"- Stock count: {stock_count}",
+                ]
+            ).strip()
+            return self._maybe_ai_wrap(user_query=user_query, fact_answer=fact, extra_context=ctx)
 
         return FALLBACK_MESSAGE
 
@@ -309,6 +526,7 @@ def main() -> None:
     print("TechGear chatbot — ask a question or type 'quit' to exit")
     if debug:
         print("DEBUG: running in debug mode", flush=True)
+        print(f"DEBUG: ai_enabled: {bot._ai_client is not None}", flush=True)
 
     while True:
         try:
